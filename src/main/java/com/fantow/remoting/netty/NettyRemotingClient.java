@@ -3,7 +3,10 @@ package com.fantow.remoting.netty;
 import com.fantow.remoting.ChannelEventListener;
 import com.fantow.remoting.InvokeCallback;
 import com.fantow.remoting.RemotingClient;
+import com.fantow.remoting.common.Pair;
+import com.fantow.remoting.common.RemotingHelper;
 import com.fantow.remoting.common.RemotingUtil;
+import com.fantow.remoting.exception.RemotingException;
 import com.fantow.remoting.protocol.RPCHook;
 import com.fantow.remoting.protocol.RemotingCommand;
 import io.netty.bootstrap.Bootstrap;
@@ -161,23 +164,188 @@ public class NettyRemotingClient extends AbstractNettyRemoting implements Remoti
     }
 
     @Override
-    public RemotingCommand invokeSync(String addr, RemotingCommand request, long timeoutMillis) {
+    public RemotingCommand invokeSync(String addr, RemotingCommand request, long timeoutMillis) throws InterruptedException, RemotingException {
+        long beginStartTime = System.currentTimeMillis();
+        Channel channel = this.getAndCreateChannel(addr);
+        if(channel != null && channel.isActive()){
+            // 现在还不知道这个doBeforeRpcHooks和doAfterRpcHooks为什么会出现在invokeSync中？？？
+            doBeforeRpcHooks(addr,request);
+            RemotingCommand response = this.invokeSyncImpl(channel,request,timeoutMillis);
+
+            doAfterRpcHooks(RemotingHelper.parseChannelRemoteAddr(channel),request,response);
+            return response;
+        }else{
+            this.closeChannel(channel);
+            throw new RemotingException("can not get a right channel about remoting: " + addr);
+        }
+
+    }
+
+    // 参数addr是指NameSrv的addr
+    // 如果给定addr不为空，要么去channelTable中去找，要么就主动连接一次
+    // 如果给定addr为空，就重新从NameSrvList中拿一个addr
+    private Channel getAndCreateChannel(String addr) throws InterruptedException {
+        if(addr == null){
+            return getAndCreateNameServerChannel();
+        }
+
+        // ChannelWrapper中封装的是channelFuture
+        ChannelWrapper cw = this.channelTables.get(addr);
+        if(cw != null && cw.isAlive()){
+            return cw.getChannel();
+        }
+
+        return this.createChannel(addr);
+    }
+
+    private Channel getAndCreateNameServerChannel() throws InterruptedException {
+        // 获取到之前选定的namesrv的addr
+        String addr = this.namesrvAddrChoosed.get();
+        if (addr != null) {
+            ChannelWrapper cw = this.channelTables.get(addr);
+            if (cw != null && cw.isAlive()) {
+                return cw.getChannel();
+            }
+        }
+
+        List<String> addrList = this.namesrvAddrList.get();
+        if (this.lockNamesrvChannel.tryLock(LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+            try {
+                // 保证即使是不同线程进入这部分，获取到的channel都是同一份。
+                addr = this.namesrvAddrChoosed.get();
+                if (addr != null) {
+                    ChannelWrapper cw = this.channelTables.get(addr);
+                    if (cw != null && cw.isAlive()) {
+                        return cw.getChannel();
+                    }
+                }
+
+                if (addrList != null && !addrList.isEmpty()) {
+                    for (int i = 0; i < addrList.size(); i++) {
+                        int index = this.namesrvIndex.incrementAndGet();
+                        index = Math.abs(index) % addrList.size();
+                        String newAddr = addrList.get(index);
+
+                        this.namesrvAddrChoosed.set(newAddr);
+                        logger.info("The new NameServer is chosen: " + newAddr);
+                        Channel channelNew = this.createChannel(newAddr);
+                        if (channelNew != null) {
+                            return channelNew;
+                        }
+                    }
+                }
+            } finally {
+                this.lockNamesrvChannel.unlock();
+            }
+
+            return null;
+        }
+    }
+
+    // 根据Addr从channelTables中获取Channel
+    // 如果无法从channelTables中获取，会进行连接，并将channel包装在ChannelWrapper中
+    // 再存入channelTables中。
+    private Channel createChannel(String addr) throws InterruptedException {
+        ChannelWrapper cw = this.channelTables.get(addr);
+        if(cw != null && cw.isAlive()){
+            return cw.getChannel();
+        }
+
+        if(this.lockChannelTables.tryLock(LOCK_TIMEOUT_MILLIS,TimeUnit.MILLISECONDS)){
+
+            try {
+                boolean createNewConnection;
+                cw = this.channelTables.get(addr);
+                // 为什么要分这么多的if分支，可能是因为Channel创建比较耗时
+                if (cw != null) {
+                    if (cw.isAlive()) {
+                        return cw.getChannel();
+                    } else if (!cw.channelFuture.isDone()) {
+                        // 表示创建还未结束，但是正在创建
+                        createNewConnection = false;
+                    } else {
+                        createNewConnection = true;
+                    }
+                } else {
+                    createNewConnection = true;
+                }
+
+                // 如果的确需要创建新的Channel
+                if (createNewConnection) {
+                    ChannelFuture channelFuture = this.bootstrap.connect(RemotingHelper.string2SocketAddress(addr));
+                    logger.info("call the method createChannel to create new Channel for addr:{}", addr);
+
+                    cw = new ChannelWrapper(channelFuture);
+                    // 其实将cw存入channelTables的逻辑应该在下面验证完cw.isAlive()中进行
+                    // 但是使用时每次都会在获取cw时判断.isAlive()，所以无所谓了。
+                    this.channelTables.put(addr, cw);
+                }
+            }finally {
+                this.lockChannelTables.unlock();
+            }
+        }else{
+            logger.error("Can not get ChannelTable until timeout.");
+        }
+
+        if(cw != null){
+            ChannelFuture channelFuture = cw.getChannelFuture();
+            // 等待channelFuture完成直到超时
+            if(channelFuture.awaitUninterruptibly(this.nettyClientConfig.getConnectionTimeoutMillis())){
+                if(cw.isAlive()){
+                    logger.info("createChannel: connect remote host:{} success",addr);
+                }else{
+                    logger.info("createChannel: connect remote host:{} failed",addr);
+                }
+            }else{
+                logger.info("createChannel:connect remote host:{} timeout",addr);
+            }
+        }
+
         return null;
     }
 
-    @Override
-    public void invokeAsync(String addr, RemotingCommand request, long timoutMiilis, InvokeCallback invokeCallback) {
 
+    @Override
+    public void invokeAsync(String addr, RemotingCommand request, long timoutMiilis, InvokeCallback invokeCallback) throws InterruptedException, RemotingException {
+
+        Channel channel = this.getAndCreateChannel(addr);
+        if(channel != null && channel.isActive()){
+            try{
+                doBeforeRpcHooks(addr,request);
+                this.invokeAsyncImpl(channel,request,timoutMiilis,invokeCallback);
+            }catch (Exception ex){
+                logger.error("invokeAsync cause error:{}",ex);
+                this.closeChannel(channel);
+            }
+        }else{
+            this.closeChannel(channel);
+            throw new RemotingException("Can not get a right channel about:" + addr);
+        }
     }
 
     @Override
-    public void invokeOneway(String addr, RemotingCommand request, long timeoutMillis) {
+    public void invokeOneway(String addr, RemotingCommand request, long timeoutMillis) throws InterruptedException, RemotingException {
 
+        Channel channel = this.getAndCreateChannel(addr);
+        if(channel != null && channel.isActive()){
+            doBeforeRpcHooks(addr,request);
+            this.invokeOnewayImpl(channel,request,timeoutMillis);
+
+        }else{
+            this.closeChannel(channel);
+            throw new RemotingException("Can not get a right channel about: " + addr);
+        }
     }
 
     @Override
     public void registerProcessor(int requestCode, NettyRequestProcessor processor, ExecutorService executor) {
+        ExecutorService executorThis = executor;
+        if(executorThis != null){
+            executorThis = this.publicExecutor;
+        }
 
+        Pair<NettyRequestProcessor,ExecutorService> pair = new Pair<>(processor,executorThis);
+        this.processorTable.put(requestCode,pair);
     }
 
     @Override
